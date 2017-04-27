@@ -535,7 +535,8 @@ ev_add_map (char * dev, char * alias, struct vectors * vecs)
 	r = get_refwwid(CMD_NONE, dev, DEV_DEVMAP, vecs->pathvec, &refwwid);
 
 	if (refwwid) {
-		r = coalesce_paths(vecs, NULL, refwwid, 0, CMD_NONE);
+		r = coalesce_paths(vecs, NULL, refwwid, FORCE_RELOAD_NONE,
+				   CMD_NONE);
 		dm_lib_release();
 	}
 
@@ -1079,7 +1080,7 @@ uxsock_trigger (char * str, char ** reply, int * len, bool is_root,
 		return 1;
 	}
 
-	r = parse_cmd(str, reply, len, vecs, uxsock_timeout / 1000);
+	r = parse_cmd(str, reply, len, vecs, uxsock_timeout);
 
 	if (r > 0) {
 		if (r == ETIMEDOUT)
@@ -1711,7 +1712,7 @@ check_path (struct vectors * vecs, struct path * pp, int ticks)
 		pp->checkint = conf->checkint;
 		put_multipath_config(conf);
 
-		if (newstate == PATH_DOWN || newstate == PATH_SHAKY || newstate == PATH_TIMEOUT) {
+		if (newstate != PATH_UP && newstate != PATH_GHOST) {
 			/*
 			 * proactively fail path in the DM
 			 */
@@ -2016,6 +2017,7 @@ configure (struct vectors * vecs, int start_waiters)
 	vector mpvec;
 	int i, ret;
 	struct config *conf;
+	static int force_reload = FORCE_RELOAD_WEAK;
 
 	if (!vecs->pathvec && !(vecs->pathvec = vector_alloc())) {
 		condlog(0, "couldn't allocate path vec in configure");
@@ -2059,8 +2061,14 @@ configure (struct vectors * vecs, int start_waiters)
 
 	/*
 	 * create new set of maps & push changed ones into dm
+	 * In the first call, use FORCE_RELOAD_WEAK to avoid making
+	 * superfluous ACT_RELOAD ioctls. Later calls are done
+	 * with FORCE_RELOAD_YES.
 	 */
-	if (coalesce_paths(vecs, mpvec, NULL, 1, CMD_NONE)) {
+	ret = coalesce_paths(vecs, mpvec, NULL, force_reload, CMD_NONE);
+	if (force_reload == FORCE_RELOAD_WEAK)
+		force_reload = FORCE_RELOAD_YES;
+	if (ret) {
 		condlog(0, "configure failed while coalescing paths");
 		return 1;
 	}
@@ -2160,6 +2168,10 @@ reconfigure (struct vectors * vecs)
 		conf->verbosity = verbosity;
 	if (bindings_read_only)
 		conf->bindings_read_only = bindings_read_only;
+	if (conf->find_multipaths) {
+		condlog(2, "find_multipaths is set: -n is implied");
+		ignore_new_devs = 1;
+	}
 	if (ignore_new_devs)
 		conf->ignore_new_devs = ignore_new_devs;
 	uxsock_timeout = conf->uxsock_timeout;
@@ -2257,6 +2269,12 @@ sigusr2 (int sig)
 static void
 signal_init(void)
 {
+	sigset_t set;
+
+	sigemptyset(&set);
+	sigaddset(&set, SIGUSR2);
+	pthread_sigmask(SIG_SETMASK, &set, NULL);
+
 	signal_set(SIGHUP, sighup);
 	signal_set(SIGUSR1, sigusr1);
 	signal_set(SIGUSR2, sigusr2);
@@ -2338,6 +2356,7 @@ child (void * param)
 	int i;
 #ifdef USE_SYSTEMD
 	unsigned long checkint;
+	int startup_done = 0;
 #endif
 	int rc;
 	int pid_fd = -1;
@@ -2486,10 +2505,6 @@ child (void * param)
 	}
 	pthread_attr_destroy(&misc_attr);
 
-#ifdef USE_SYSTEMD
-	sd_notify(0, "READY=1");
-#endif
-
 	while (running_state != DAEMON_SHUTDOWN) {
 		pthread_cleanup_push(config_cleanup, NULL);
 		pthread_mutex_lock(&config_lock);
@@ -2511,6 +2526,12 @@ child (void * param)
 			}
 			lock_cleanup_pop(vecs->lock);
 			post_config_state(DAEMON_IDLE);
+#ifdef USE_SYSTEMD
+			if (!startup_done) {
+				sd_notify(0, "READY=1");
+				startup_done = 1;
+			}
+#endif
 		}
 	}
 
